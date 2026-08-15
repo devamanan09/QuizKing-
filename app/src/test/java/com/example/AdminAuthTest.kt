@@ -99,6 +99,45 @@ class AdminAuthTest {
     }
 
     @Test
+    fun `password policy validator enforces complexity requirements`() {
+        // Blank
+        assertNotNull(AdminAuthManager.validatePasswordPolicy(""))
+        assertNotNull(AdminAuthManager.validatePasswordPolicy("   "))
+
+        // Too short (<10 chars)
+        assertNotNull(AdminAuthManager.validatePasswordPolicy("Pass1!"))
+
+        // Missing uppercase
+        assertNotNull(AdminAuthManager.validatePasswordPolicy("password123!"))
+
+        // Missing lowercase
+        assertNotNull(AdminAuthManager.validatePasswordPolicy("PASSWORD123!"))
+
+        // Missing number
+        assertNotNull(AdminAuthManager.validatePasswordPolicy("PasswordSpecial!"))
+
+        // Missing symbol
+        assertNotNull(AdminAuthManager.validatePasswordPolicy("Password12345"))
+
+        // Valid strong compliant passwords
+        assertNull(AdminAuthManager.validatePasswordPolicy("CorrectHorse#Battery99"))
+        assertNull(AdminAuthManager.validatePasswordPolicy("AdminSecure!2026"))
+        assertNull(AdminAuthManager.validatePasswordPolicy("Kv9\$mP2@xL7#"))
+    }
+
+    @Test
+    fun `createAdminUser rejects when caller is not authenticated as super admin`() = runTest {
+        val result = AdminAuthManager.createAdminUser(
+            email = "new_admin@company.com",
+            password = "StrongPassword123!",
+            displayName = "New Admin",
+            role = AdminRole.CONTENT_MANAGER
+        )
+        assertTrue(result.isFailure)
+        assertTrue(result.exceptionOrNull() is IllegalStateException)
+    }
+
+    @Test
     fun `disabled admin status evaluates isActive as false`() {
         val disabledAdmin = AdminUser(
             uid = "disabled_uid",

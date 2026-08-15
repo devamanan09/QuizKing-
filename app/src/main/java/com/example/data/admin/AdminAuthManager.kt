@@ -416,16 +416,43 @@ object AdminAuthManager {
     }
 
     // ==========================================
+    // PASSWORD POLICY & CREDENTIAL INTEGRITY
+    // ==========================================
+
+    fun validatePasswordPolicy(password: String): String? {
+        val clean = password.trim()
+        if (clean.isEmpty()) {
+            return "Password is required and cannot be blank."
+        }
+        if (clean.length < 10) {
+            return "Password must be at least 10 characters in length."
+        }
+        if (!clean.any { it.isUpperCase() }) {
+            return "Password must contain at least one uppercase letter (A-Z)."
+        }
+        if (!clean.any { it.isLowerCase() }) {
+            return "Password must contain at least one lowercase letter (a-z)."
+        }
+        if (!clean.any { it.isDigit() }) {
+            return "Password must contain at least one numeric digit (0-9)."
+        }
+        if (!clean.any { !it.isLetterOrDigit() }) {
+            return "Password must contain at least one special symbol (!@#$%^&*)."
+        }
+        return null
+    }
+
+    // ==========================================
     // ADMIN USER MANAGEMENT (SUPER_ADMIN ONLY)
     // Invokes trusted Backend Cloud Functions
     // ==========================================
 
     suspend fun createAdminUser(
         email: String,
+        password: String,
         displayName: String,
         role: AdminRole,
-        customPermissions: AdminPermissions? = null,
-        password: String = ""
+        customPermissions: AdminPermissions? = null
     ): Result<AdminUser> = withContext(Dispatchers.IO) {
         val current = _currentAdmin.value
         if (current == null || current.role != AdminRole.SUPER_ADMIN) {
@@ -437,7 +464,11 @@ object AdminAuthManager {
             return@withContext Result.failure(IllegalArgumentException("Please provide a valid email address."))
         }
 
-        val pass = password.ifBlank { "AdminSecurePass2026!" }
+        val passwordError = validatePasswordPolicy(password)
+        if (passwordError != null) {
+            return@withContext Result.failure(IllegalArgumentException(passwordError))
+        }
+
         val permissions = customPermissions ?: AdminPermissions.forRole(role)
 
         // 1. Invoke trusted backend Cloud Function to create Auth user and assign Custom Claims
@@ -446,7 +477,7 @@ object AdminAuthManager {
             try {
                 val data = hashMapOf(
                     "email" to cleanEmail,
-                    "password" to pass,
+                    "password" to password.trim(),
                     "displayName" to displayName.ifBlank { cleanEmail.substringBefore("@") },
                     "role" to role.name,
                     "customPermissions" to permissions.toMap()

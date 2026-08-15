@@ -71,6 +71,33 @@ const ROLE_PERMISSIONS = {
 };
 
 /**
+ * Server-Side Password Policy Validation
+ * Requires min 10 characters, uppercase, lowercase, digit, and special character.
+ */
+function validatePasswordPolicy(password) {
+    if (!password || typeof password !== 'string') {
+        return 'Password is required and cannot be blank.';
+    }
+    const clean = password.trim();
+    if (clean.length < 10) {
+        return 'Password must be at least 10 characters in length.';
+    }
+    if (!/[A-Z]/.test(clean)) {
+        return 'Password must contain at least one uppercase letter.';
+    }
+    if (!/[a-z]/.test(clean)) {
+        return 'Password must contain at least one lowercase letter.';
+    }
+    if (!/[0-9]/.test(clean)) {
+        return 'Password must contain at least one numeric digit.';
+    }
+    if (!/[!@#$%^&*()_+\-=\[\]{};':"\\|,.<>\/?~`]/.test(clean)) {
+        return 'Password must contain at least one special symbol.';
+    }
+    return null;
+}
+
+/**
  * Cloud Function: Create Admin User (Super Admin only)
  * Creates user in Firebase Auth, sets authoritative Custom Claims,
  * and creates admin profile in Firestore.
@@ -90,6 +117,11 @@ exports.createAdminUser = functions.https.onCall(async (data, context) => {
     const { email, password, displayName, role, customPermissions } = data;
     if (!email || !password || !role) {
         throw new functions.https.HttpsError('invalid-argument', 'email, password, and role are required.');
+    }
+
+    const passwordError = validatePasswordPolicy(password);
+    if (passwordError) {
+        throw new functions.https.HttpsError('invalid-argument', passwordError);
     }
 
     const roleName = role.toUpperCase();
@@ -354,6 +386,10 @@ exports.bootstrapSuperAdmin = async function(email, password, displayName = 'Sup
             console.log(`[BOOTSTRAP] Existing Firebase user found (UID: ${userRecord.uid})`);
         } catch (e) {
             if (e.code === 'auth/user-not-found') {
+                const passErr = validatePasswordPolicy(password);
+                if (passErr) {
+                    throw new Error(`[BOOTSTRAP] Password policy violation: ${passErr}`);
+                }
                 userRecord = await auth.createUser({
                     email: email,
                     password: password,

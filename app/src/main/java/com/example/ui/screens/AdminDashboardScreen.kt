@@ -23,6 +23,8 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -179,10 +181,10 @@ fun AdminDashboardScreen(
                     coroutineScope.launch {
                         AdminAuthManager.createAdminUser(
                             email = email,
+                            password = password,
                             displayName = name,
                             role = role,
-                            customPermissions = permissions,
-                            password = password
+                            customPermissions = permissions
                         )
                     }
                     showCreateAdminDialog = false
@@ -1426,9 +1428,15 @@ private fun CreateAdminDialog(
 ) {
     var email by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var passwordVisible by remember { mutableStateOf(false) }
     var name by remember { mutableStateOf("") }
     var selectedRole by remember { mutableStateOf(AdminRole.CONTENT_MANAGER) }
     var permissions by remember { mutableStateOf(AdminPermissions.forRole(AdminRole.CONTENT_MANAGER)) }
+
+    val passwordError = remember(password) {
+        if (password.isEmpty()) null else AdminAuthManager.validatePasswordPolicy(password)
+    }
+    val isValid = email.isNotBlank() && email.contains("@") && AdminAuthManager.validatePasswordPolicy(password) == null
 
     Dialog(onDismissRequest = onDismiss) {
         CyberCard(
@@ -1457,7 +1465,22 @@ private fun CreateAdminDialog(
             OutlinedTextField(
                 value = password,
                 onValueChange = { password = it },
-                label = { Text("Initial Password (min 6 chars)") },
+                label = { Text("Initial Password") },
+                supportingText = {
+                    if (passwordError != null) {
+                        Text(passwordError, color = ErrorRed, style = MaterialTheme.typography.labelSmall)
+                    } else {
+                        Text("Min 10 chars (uppercase, lowercase, number, symbol)", color = TextMuted, style = MaterialTheme.typography.labelSmall)
+                    }
+                },
+                isError = passwordError != null,
+                visualTransformation = if (passwordVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                trailingIcon = {
+                    val image = if (passwordVisible) Icons.Filled.Visibility else Icons.Filled.VisibilityOff
+                    IconButton(onClick = { passwordVisible = !passwordVisible }) {
+                        Icon(imageVector = image, contentDescription = if (passwordVisible) "Hide password" else "Show password", tint = TextMuted)
+                    }
+                },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true
             )
@@ -1504,10 +1527,11 @@ private fun CreateAdminDialog(
                 Spacer(modifier = Modifier.width(8.dp))
                 Button(
                     onClick = {
-                        if (email.isNotBlank()) {
-                            onAdminCreated(email, password, name, selectedRole, permissions)
+                        if (isValid) {
+                            onAdminCreated(email.trim(), password.trim(), name.trim(), selectedRole, permissions)
                         }
                     },
+                    enabled = isValid,
                     colors = ButtonDefaults.buttonColors(containerColor = AccentGold, contentColor = DarkBackground)
                 ) {
                     Text("Create Admin", fontWeight = FontWeight.Bold)
