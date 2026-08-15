@@ -14,21 +14,24 @@ service cloud.firestore {
     function isAdmin() {
       return isAuthenticated() && (
         request.auth.token.admin == true ||
-        request.auth.token.role in ['super_admin', 'admin', 'content_manager', 'analyst', 'support']
+        request.auth.token.super_admin == true ||
+        request.auth.token.role in ['SUPER_ADMIN', 'ADMIN', 'CONTENT_MANAGER', 'ANALYST', 'SUPPORT', 'super_admin', 'admin', 'content_manager', 'analyst', 'support'] ||
+        request.auth.token.adminRole in ['SUPER_ADMIN', 'ADMIN', 'CONTENT_MANAGER', 'ANALYST', 'SUPPORT', 'super_admin', 'admin', 'content_manager', 'analyst', 'support']
       );
     }
 
     function isSuperAdmin() {
       return isAuthenticated() && (
         request.auth.token.super_admin == true ||
-        request.auth.token.role == 'super_admin'
+        request.auth.token.role in ['SUPER_ADMIN', 'super_admin'] ||
+        request.auth.token.adminRole in ['SUPER_ADMIN', 'super_admin']
       );
     }
 
     function hasPermission(permissionName) {
       return isAdmin() && (
         isSuperAdmin() ||
-        request.auth.token.permissions[permissionName] == true
+        (request.auth.token.permissions != null && request.auth.token.permissions[permissionName] == true)
       );
     }
 
@@ -36,10 +39,10 @@ service cloud.firestore {
     // ADMIN ONLY COLLECTIONS
     // ==========================================
 
-    // Admin Users Directory - strictly Super Admin manage, Admins can read profile
+    // Admin Users Directory - Super Admin can write any, Admin can update their own lastLoginAt, Admins can read
     match /adminUsers/{adminId} {
       allow read: if isAdmin();
-      allow write: if isSuperAdmin();
+      allow write: if isSuperAdmin() || (isAdmin() && isOwner(adminId));
     }
 
     // Admin Audit Logs - immutable audit trail
@@ -52,7 +55,7 @@ service cloud.firestore {
     // RAG Knowledge Sources & AI Pipeline Configuration
     match /ragKnowledgeSources/{docId} {
       allow read: if isAdmin();
-      allow write: if hasPermission('ragManagement');
+      allow write: if hasPermission('ragManagement') || isSuperAdmin();
     }
 
     // System Configuration
@@ -64,7 +67,7 @@ service cloud.firestore {
     // Question Repository - Players can read approved questions, only Admins with questionManagement can write
     match /questions/{questionId} {
       allow read: if isAuthenticated();
-      allow write: if hasPermission('questionManagement');
+      allow write: if hasPermission('questionManagement') || isSuperAdmin();
     }
 
     // ==========================================

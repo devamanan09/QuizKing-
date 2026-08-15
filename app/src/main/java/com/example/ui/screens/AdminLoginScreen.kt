@@ -28,12 +28,15 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
 import com.example.data.admin.AdminAuthManager
 import com.example.data.admin.AdminAuthResult
 import com.example.ui.components.CyberCard
 import com.example.ui.components.GlowCyanButton
 import com.example.ui.theme.*
+import com.google.firebase.auth.FirebaseAuth
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 
 @Composable
 fun AdminLoginScreen(
@@ -42,24 +45,31 @@ fun AdminLoginScreen(
     modifier: Modifier = Modifier
 ) {
     val coroutineScope = rememberCoroutineScope()
-    var email by remember { mutableStateOf("admin@quizking.internal") }
-    var password by remember { mutableStateOf("AdminSecurePass123!") }
+    var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
     var isPasswordVisible by remember { mutableStateOf(false) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    var showDemoPicker by remember { mutableStateOf(false) }
+    var successNotification by remember { mutableStateOf<String?>(null) }
+
+    var showForgotPasswordDialog by remember { mutableStateOf(false) }
+    var resetEmail by remember { mutableStateOf("") }
+    var resetLoading by remember { mutableStateOf(false) }
+    var resetMessage by remember { mutableStateOf<String?>(null) }
 
     fun performLogin() {
-        if (email.isBlank() || password.isBlank()) {
+        val cleanEmail = email.trim()
+        if (cleanEmail.isBlank() || password.isBlank()) {
             errorMessage = "Please enter both administrator email and password."
             return
         }
 
         isLoading = true
         errorMessage = null
+        successNotification = null
 
         coroutineScope.launch {
-            val result = AdminAuthManager.loginAdmin(email.trim(), password)
+            val result = AdminAuthManager.loginAdmin(cleanEmail, password)
             isLoading = false
             when (result) {
                 is AdminAuthResult.Success -> {
@@ -73,6 +83,9 @@ fun AdminLoginScreen(
                 }
                 is AdminAuthResult.AuthFailed -> {
                     errorMessage = result.errorMessage
+                }
+                is AdminAuthResult.SessionExpired -> {
+                    errorMessage = result.reason
                 }
             }
         }
@@ -216,6 +229,38 @@ fun AdminLoginScreen(
                     }
                 }
 
+                // Success Message banner
+                AnimatedVisibility(visible = successNotification != null) {
+                    successNotification?.let { msg ->
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 16.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(SuccessGreen.copy(alpha = 0.15f))
+                                .border(1.dp, SuccessGreen.copy(alpha = 0.5f), RoundedCornerShape(10.dp))
+                                .padding(12.dp)
+                        ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.CheckCircle,
+                                    contentDescription = null,
+                                    tint = SuccessGreen,
+                                    modifier = Modifier.size(20.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = msg,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = SuccessGreen,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                )
+                            }
+                        }
+                    }
+                }
+
                 // Email input
                 Text(
                     text = "ADMINISTRATOR EMAIL",
@@ -238,7 +283,7 @@ fun AdminLoginScreen(
                             tint = NeonCyan.copy(alpha = 0.7f)
                         )
                     },
-                    placeholder = { Text("admin@quizking.internal", color = TextMuted) },
+                    placeholder = { Text("Enter administrator email", color = TextMuted) },
                     singleLine = true,
                     keyboardOptions = KeyboardOptions(
                         keyboardType = KeyboardType.Email,
@@ -258,13 +303,31 @@ fun AdminLoginScreen(
                 Spacer(modifier = Modifier.height(16.dp))
 
                 // Password input
-                Text(
-                    text = "SECURE PASSWORD",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontWeight = FontWeight.Bold,
-                        color = TextMuted
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "SECURE PASSWORD",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = TextMuted
+                        )
                     )
-                )
+                    Text(
+                        text = "Forgot Password?",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            color = NeonCyan,
+                            fontWeight = FontWeight.Bold
+                        ),
+                        modifier = Modifier.clickable {
+                            resetEmail = email
+                            resetMessage = null
+                            showForgotPasswordDialog = true
+                        }
+                    )
+                }
                 Spacer(modifier = Modifier.height(6.dp))
                 OutlinedTextField(
                     value = password,
@@ -316,128 +379,98 @@ fun AdminLoginScreen(
                     icon = Icons.Default.VpnKey,
                     testTag = "admin_login_submit_btn"
                 )
+            }
+        }
 
-                Spacer(modifier = Modifier.height(16.dp))
-
-                // Demo / Test account quick selector
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.Center
+        // FORGOT PASSWORD DIALOG
+        if (showForgotPasswordDialog) {
+            Dialog(onDismissRequest = { showForgotPasswordDialog = false }) {
+                CyberCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    borderColor = NeonCyan.copy(alpha = 0.5f),
+                    backgroundColor = DarkSurfaceElevated
                 ) {
-                    TextButton(onClick = { showDemoPicker = !showDemoPicker }) {
-                        Icon(
-                            imageVector = Icons.Default.Tune,
-                            contentDescription = null,
-                            tint = TextMuted,
-                            modifier = Modifier.size(16.dp)
+                    Text(
+                        text = "Reset Admin Password",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            color = TextPrimary
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (showDemoPicker) "Hide Role Tester" else "Role Testing & Quick Credentials",
-                            color = TextMuted,
-                            fontSize = 12.sp
-                        )
-                    }
-                }
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Enter your administrator email to receive a secure Firebase password reset link.",
+                        style = MaterialTheme.typography.bodySmall.copy(color = TextSecondary)
+                    )
 
-                AnimatedVisibility(visible = showDemoPicker) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(DarkSurface)
-                            .border(1.dp, DarkBorder, RoundedCornerShape(10.dp))
-                            .padding(10.dp)
-                    ) {
+                    Spacer(modifier = Modifier.height(16.dp))
+
+                    OutlinedTextField(
+                        value = resetEmail,
+                        onValueChange = { resetEmail = it; resetMessage = null },
+                        label = { Text("Admin Email") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Email),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedBorderColor = NeonCyan,
+                            unfocusedBorderColor = DarkBorder,
+                            focusedTextColor = TextPrimary,
+                            unfocusedTextColor = TextPrimary
+                        )
+                    )
+
+                    resetMessage?.let { msg ->
+                        Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "SELECT ROLE TEST PROFILE:",
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontWeight = FontWeight.Bold,
-                                color = NeonCyan
+                            text = msg,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                color = if (msg.contains("sent", ignoreCase = true)) SuccessGreen else ErrorRed
                             )
                         )
-                        Spacer(modifier = Modifier.height(6.dp))
+                    }
 
-                        RoleOptionRow(
-                            title = "Super Admin (Full Access)",
-                            emailVal = "admin@quizking.internal",
-                            roleTag = "SUPER_ADMIN",
-                            onSelect = { email = "admin@quizking.internal"; password = "AdminSecurePass123!" }
-                        )
+                    Spacer(modifier = Modifier.height(20.dp))
 
-                        RoleOptionRow(
-                            title = "Content Manager (Questions/RAG)",
-                            emailVal = "curator@quizking.internal",
-                            roleTag = "CONTENT_MANAGER",
-                            onSelect = { email = "curator@quizking.internal"; password = "CuratorPass123!" }
-                        )
-
-                        RoleOptionRow(
-                            title = "Intelligence Analyst (Metrics only)",
-                            emailVal = "metrics@quizking.internal",
-                            roleTag = "ANALYST",
-                            onSelect = { email = "metrics@quizking.internal"; password = "AnalystPass123!" }
-                        )
-
-                        RoleOptionRow(
-                            title = "Standard Player (Should be DENIED)",
-                            emailVal = "player@quizking.com",
-                            roleTag = "NON_ADMIN",
-                            onSelect = { email = "player@quizking.com"; password = "PlayerPass123!" }
-                        )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        TextButton(onClick = { showForgotPasswordDialog = false }) {
+                            Text("Cancel", color = TextMuted)
+                        }
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Button(
+                            onClick = {
+                                val clean = resetEmail.trim()
+                                if (clean.isBlank() || !clean.contains("@")) {
+                                    resetMessage = "Please enter a valid email address."
+                                    return@Button
+                                }
+                                resetLoading = true
+                                coroutineScope.launch {
+                                    try {
+                                        FirebaseAuth.getInstance().sendPasswordResetEmail(clean).await()
+                                        resetLoading = false
+                                        resetMessage = "Password reset email sent. Please check your inbox."
+                                        successNotification = "Password reset instructions sent to $clean."
+                                    } catch (e: Exception) {
+                                        resetLoading = false
+                                        resetMessage = e.localizedMessage ?: "Failed to send reset email."
+                                    }
+                                }
+                            },
+                            enabled = !resetLoading,
+                            colors = ButtonDefaults.buttonColors(containerColor = NeonCyan, contentColor = DarkBackground)
+                        ) {
+                            Text(if (resetLoading) "Sending..." else "Send Reset Link")
+                        }
                     }
                 }
             }
-        }
-    }
-}
-
-@Composable
-private fun RoleOptionRow(
-    title: String,
-    emailVal: String,
-    roleTag: String,
-    onSelect: () -> Unit
-) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onSelect() }
-            .padding(vertical = 6.dp, horizontal = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = title,
-                style = MaterialTheme.typography.bodySmall.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = TextPrimary
-                )
-            )
-            Text(
-                text = emailVal,
-                style = MaterialTheme.typography.labelSmall.copy(color = TextMuted)
-            )
-        }
-        Box(
-            modifier = Modifier
-                .clip(RoundedCornerShape(6.dp))
-                .background(
-                    if (roleTag == "NON_ADMIN") ErrorRed.copy(alpha = 0.15f)
-                    else NeonCyan.copy(alpha = 0.15f)
-                )
-                .padding(horizontal = 6.dp, vertical = 2.dp)
-        ) {
-            Text(
-                text = roleTag,
-                style = MaterialTheme.typography.labelSmall.copy(
-                    fontWeight = FontWeight.Bold,
-                    color = if (roleTag == "NON_ADMIN") ErrorRed else NeonCyan,
-                    fontSize = 10.sp
-                )
-            )
         }
     }
 }

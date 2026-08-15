@@ -19,43 +19,117 @@ class AdminAuthTest {
     }
 
     @Test
-    fun `super admin login succeeds with full permissions`() = runTest {
-        val result = AdminAuthManager.loginAdmin("admin@quizking.internal", "AdminSecurePass123!")
-        assertTrue(result is AdminAuthResult.Success)
-
-        val currentAdmin = AdminAuthManager.currentAdmin.value
-        assertNotNull(currentAdmin)
-        assertEquals(AdminRole.SUPER_ADMIN, currentAdmin?.role)
-        assertTrue(AdminAuthManager.requireAdmin())
-        assertTrue(AdminAuthManager.requireRole(AdminRole.SUPER_ADMIN))
-        assertTrue(AdminAuthManager.requirePermission { it.userManagement })
-        assertTrue(AdminAuthManager.requirePermission { it.ragManagement })
-    }
-
-    @Test
-    fun `non-admin user is rejected with access denied`() = runTest {
-        val result = AdminAuthManager.loginAdmin("unauthorized_player@quizking.com", "random_password")
-        assertTrue(result is AdminAuthResult.AccessDenied)
+    fun `empty credentials reject with authentication error`() = runTest {
+        val result = AdminAuthManager.loginAdmin("", "")
+        assertTrue(result is AdminAuthResult.AuthFailed)
         assertNull(AdminAuthManager.currentAdmin.value)
         assertFalse(AdminAuthManager.requireAdmin())
     }
 
     @Test
-    fun `content manager has rag permissions but cannot manage users`() = runTest {
-        val result = AdminAuthManager.loginAdmin("curator@quizking.internal", "CuratorPass123!")
-        assertTrue(result is AdminAuthResult.Success)
-
-        val current = AdminAuthManager.currentAdmin.value
-        assertEquals(AdminRole.CONTENT_MANAGER, current?.role)
-        assertTrue(AdminAuthManager.requirePermission { it.questionManagement })
-        assertTrue(AdminAuthManager.requirePermission { it.ragManagement })
-        assertFalse(AdminAuthManager.requirePermission { it.userManagement })
+    fun `super admin role matrix grants full permissions`() {
+        val permissions = AdminPermissions.forRole(AdminRole.SUPER_ADMIN)
+        assertTrue(permissions.questionManagement)
+        assertTrue(permissions.ragManagement)
+        assertTrue(permissions.analytics)
+        assertTrue(permissions.userManagement)
+        assertTrue(permissions.systemConfiguration)
+        assertTrue(permissions.moderation)
+        assertTrue(permissions.tournamentManagement)
     }
 
     @Test
-    fun `audit log records login and admin actions`() = runTest {
-        AdminAuthManager.loginAdmin("admin@quizking.internal", "AdminSecurePass123!")
-        val logs = AdminAuthManager.auditLogs.value
-        assertTrue(logs.any { it.action == "ADMIN_LOGIN" && it.adminEmail == "admin@quizking.internal" })
+    fun `content manager role matrix grants content permissions but denies user management`() {
+        val permissions = AdminPermissions.forRole(AdminRole.CONTENT_MANAGER)
+        assertTrue(permissions.questionManagement)
+        assertTrue(permissions.ragManagement)
+        assertFalse(permissions.userManagement)
+        assertFalse(permissions.systemConfiguration)
+        assertFalse(permissions.analytics)
+    }
+
+    @Test
+    fun `analyst role matrix grants analytics but denies mutating permissions`() {
+        val permissions = AdminPermissions.forRole(AdminRole.ANALYST)
+        assertTrue(permissions.analytics)
+        assertFalse(permissions.questionManagement)
+        assertFalse(permissions.ragManagement)
+        assertFalse(permissions.userManagement)
+        assertFalse(permissions.systemConfiguration)
+    }
+
+    @Test
+    fun `support role matrix grants moderation but denies user management and rag`() {
+        val permissions = AdminPermissions.forRole(AdminRole.SUPPORT)
+        assertTrue(permissions.moderation)
+        assertFalse(permissions.ragManagement)
+        assertFalse(permissions.questionManagement)
+        assertFalse(permissions.userManagement)
+    }
+
+    @Test
+    fun `admin user serialization to and from Firestore map preserves all attributes`() {
+        val original = AdminUser(
+            uid = "test_admin_uid_99",
+            email = "verified_admin@organization.com",
+            displayName = "Verified Admin",
+            role = AdminRole.ADMIN,
+            status = "ACTIVE",
+            permissions = AdminPermissions.forRole(AdminRole.ADMIN),
+            createdAt = 1700000000000L,
+            updatedAt = 1700000500000L,
+            lastLoginAt = 1700001000000L,
+            createdBy = "root_super_admin"
+        )
+
+        val map = original.toMap()
+        assertEquals("test_admin_uid_99", map["uid"])
+        assertEquals("verified_admin@organization.com", map["email"])
+        assertEquals("ADMIN", map["role"])
+        assertEquals("ACTIVE", map["status"])
+
+        val deserialized = AdminUser.fromMap("test_admin_uid_99", map)
+        assertEquals(original.uid, deserialized.uid)
+        assertEquals(original.email, deserialized.email)
+        assertEquals(original.role, deserialized.role)
+        assertEquals(original.status, deserialized.status)
+        assertTrue(deserialized.isActive)
+        assertTrue(deserialized.permissions.questionManagement)
+        assertFalse(deserialized.permissions.userManagement)
+    }
+
+    @Test
+    fun `disabled admin status evaluates isActive as false`() {
+        val disabledAdmin = AdminUser(
+            uid = "disabled_uid",
+            email = "disabled@organization.com",
+            displayName = "Disabled Admin",
+            role = AdminRole.ADMIN,
+            status = "DISABLED",
+            permissions = AdminPermissions.forRole(AdminRole.ADMIN)
+        )
+        assertFalse(disabledAdmin.isActive)
+    }
+
+    @Test
+    fun `audit log serialization preserves metadata and timestamp`() {
+        val log = AdminAuditLog(
+            adminUid = "admin_123",
+            adminEmail = "audited@organization.com",
+            action = "RUN_RAG_PIPELINE",
+            target = "question-generator",
+            timestamp = 1700002000000L,
+            metadata = mapOf("category" to "Science", "batchSize" to "30")
+        )
+
+        val map = log.toMap()
+        assertEquals("admin_123", map["adminUid"])
+        assertEquals("RUN_RAG_PIPELINE", map["action"])
+
+        val deserialized = AdminAuditLog.fromMap(log.id, map)
+        assertEquals(log.id, deserialized.id)
+        assertEquals(log.adminUid, deserialized.adminUid)
+        assertEquals(log.action, deserialized.action)
+        assertEquals("Science", deserialized.metadata["category"])
     }
 }

@@ -32,6 +32,7 @@ import com.example.data.local.QuestionEntity
 import com.example.ui.components.CyberCard
 import com.example.ui.components.GlowCyanButton
 import com.example.ui.theme.*
+import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -49,6 +50,7 @@ fun AdminDashboardScreen(
     var currentNavTab by remember { mutableIntStateOf(0) }
     // 0: Overview, 1: Question Intelligence, 2: Question Repository, 3: RAG Knowledge, 4: Admin Users, 5: Audit Logs, 6: System Health
 
+    val coroutineScope = rememberCoroutineScope()
     val adminUsersList by AdminAuthManager.adminUsers.collectAsState()
     val auditLogsList by AdminAuthManager.auditLogs.collectAsState()
 
@@ -153,7 +155,9 @@ fun AdminDashboardScreen(
                         onCreateAdminClick = { showCreateAdminDialog = true },
                         onEditAdminClick = { editingAdminUser = it },
                         onToggleStatus = { targetUid, enable ->
-                            AdminAuthManager.toggleAdminStatus(targetUid, enable)
+                            coroutineScope.launch {
+                                AdminAuthManager.toggleAdminStatus(targetUid, enable)
+                            }
                         }
                     )
                     5 -> AdminAuditLogsTab(
@@ -172,7 +176,9 @@ fun AdminDashboardScreen(
             CreateAdminDialog(
                 onDismiss = { showCreateAdminDialog = false },
                 onAdminCreated = { email, name, role, permissions ->
-                    AdminAuthManager.createAdminUser(email, name, role, permissions)
+                    coroutineScope.launch {
+                        AdminAuthManager.createAdminUser(email, name, role, permissions)
+                    }
                     showCreateAdminDialog = false
                 }
             )
@@ -184,7 +190,9 @@ fun AdminDashboardScreen(
                 target = targetAdmin,
                 onDismiss = { editingAdminUser = null },
                 onSave = { newRole, newPerms ->
-                    AdminAuthManager.updateAdminRoleAndPermissions(targetAdmin.uid, newRole, newPerms)
+                    coroutineScope.launch {
+                        AdminAuthManager.updateAdminRoleAndPermissions(targetAdmin.uid, newRole, newPerms)
+                    }
                     editingAdminUser = null
                 }
             )

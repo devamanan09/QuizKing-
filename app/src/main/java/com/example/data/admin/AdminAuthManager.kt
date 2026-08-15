@@ -1,8 +1,12 @@
 package com.example.data.admin
 
 import android.util.Log
+import com.google.firebase.FirebaseNetworkException
 import com.google.firebase.auth.FirebaseAuth
+import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
+import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.firestore.FirebaseFirestore
+import com.google.firebase.firestore.Query
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -13,13 +17,39 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
+/**
+ * Production-grade Administrator Authentication and Authorization Manager.
+ * 
+ * Enforces server-side authority:
+ * 1. Firebase Authentication (identity verification)
+ * 2. Firebase Custom Claims & Protected Firestore adminUsers/{uid} verification
+ * 3. Granular Role-Based Access Control (RBAC) & Permission enforcement
+ * 4. Immutable Audit Trail logging in Firestore
+ * 
+ * Client-side "isAdmin" flags or local mock lists are strictly disallowed.
+ */
 object AdminAuthManager {
     private const val TAG = "AdminAuthManager"
     private const val ADMIN_USERS_COLLECTION = "adminUsers"
     private const val AUDIT_LOGS_COLLECTION = "adminAuditLogs"
 
-    private val auth: FirebaseAuth by lazy { FirebaseAuth.getInstance() }
-    private val firestore: FirebaseFirestore by lazy { FirebaseFirestore.getInstance() }
+    private fun getAuth(): FirebaseAuth? {
+        return try {
+            FirebaseAuth.getInstance()
+        } catch (e: Exception) {
+            Log.w(TAG, "FirebaseAuth not available: ${e.message}")
+            null
+        }
+    }
+
+    private fun getFirestore(): FirebaseFirestore? {
+        return try {
+            FirebaseFirestore.getInstance()
+        } catch (e: Exception) {
+            Log.w(TAG, "FirebaseFirestore not available: ${e.message}")
+            null
+        }
+    }
 
     private val _currentAdmin = MutableStateFlow<AdminUser?>(null)
     val currentAdmin: StateFlow<AdminUser?> = _currentAdmin.asStateFlow()
@@ -36,157 +66,247 @@ object AdminAuthManager {
     private val _authErrorMessage = MutableStateFlow<String?>(null)
     val authErrorMessage: StateFlow<String?> = _authErrorMessage.asStateFlow()
 
+    private val coroutineScope = CoroutineScope(Dispatchers.IO)
+
     init {
-        // Initialize default seed admin registry and audit logs
-        initDefaultAdminState()
-    }
-
-    private fun initDefaultAdminState() {
-        val initialSuperAdmin = AdminUser(
-            uid = "super_admin_001",
-            email = "admin@quizking.internal",
-            displayName = "Super Admin Ops",
-            role = AdminRole.SUPER_ADMIN,
-            status = "active",
-            permissions = AdminPermissions.forRole(AdminRole.SUPER_ADMIN),
-            createdAt = System.currentTimeMillis() - 86400000L * 30,
-            updatedAt = System.currentTimeMillis(),
-            lastLoginAt = System.currentTimeMillis() - 3600000L,
-            createdBy = "SYSTEM_ROOT"
-        )
-
-        val contentManager = AdminUser(
-            uid = "content_mgr_002",
-            email = "curator@quizking.internal",
-            displayName = "Content Curator",
-            role = AdminRole.CONTENT_MANAGER,
-            status = "active",
-            permissions = AdminPermissions.forRole(AdminRole.CONTENT_MANAGER),
-            createdAt = System.currentTimeMillis() - 86400000L * 14,
-            updatedAt = System.currentTimeMillis(),
-            lastLoginAt = System.currentTimeMillis() - 7200000L,
-            createdBy = "super_admin_001"
-        )
-
-        val analyst = AdminUser(
-            uid = "analyst_003",
-            email = "metrics@quizking.internal",
-            displayName = "Intelligence Analyst",
-            role = AdminRole.ANALYST,
-            status = "active",
-            permissions = AdminPermissions.forRole(AdminRole.ANALYST),
-            createdAt = System.currentTimeMillis() - 86400000L * 7,
-            updatedAt = System.currentTimeMillis(),
-            lastLoginAt = System.currentTimeMillis() - 86400000L,
-            createdBy = "super_admin_001"
-        )
-
-        _adminUsers.value = listOf(initialSuperAdmin, contentManager, analyst)
-
-        _auditLogs.value = listOf(
-            AdminAuditLog(
-                adminUid = "super_admin_001",
-                adminEmail = "admin@quizking.internal",
-                action = "SYSTEM_BOOTSTRAP",
-                target = "admin-registry",
-                timestamp = System.currentTimeMillis() - 86400000L * 30,
-                metadata = mapOf("version" to "1.0", "engine" to "RAG-AutoApprove")
-            ),
-            AdminAuditLog(
-                adminUid = "super_admin_001",
-                adminEmail = "admin@quizking.internal",
-                action = "RUN_RAG_PIPELINE",
-                target = "question-generation",
-                timestamp = System.currentTimeMillis() - 86400000L * 2,
-                metadata = mapOf("questions_generated" to "30", "approved" to "30")
-            ),
-            AdminAuditLog(
-                adminUid = "super_admin_001",
-                adminEmail = "admin@quizking.internal",
-                action = "CREATE_ADMIN",
-                target = "curator@quizking.internal",
-                timestamp = System.currentTimeMillis() - 86400000L * 14,
-                metadata = mapOf("assignedRole" to "CONTENT_MANAGER")
-            )
-        )
+        // Automatically check if a valid, authorized Admin session is currently active
+        coroutineScope.launch {
+            checkExistingSession()
+        }
     }
 
     /**
-     * Authenticate an Admin via email and password using Firebase Authentication
-     * and strictly verify Admin authorization and permissions.
+     * Authenticate an Admin via email and password using Firebase Authentication,
+     * and strictly verify server-side Admin authorization from Custom Claims & Firestore.
      */
     suspend fun loginAdmin(email: String, pass: String): AdminAuthResult = withContext(Dispatchers.IO) {
         _isLoading.value = true
         _authErrorMessage.value = null
 
         val cleanEmail = email.trim()
+        if (cleanEmail.isEmpty() || pass.isEmpty()) {
+            _isLoading.value = false
+            val err = "Please enter both administrator email and password."
+            _authErrorMessage.value = err
+            return@withContext AdminAuthResult.AuthFailed(err)
+        }
+
+        val auth = getAuth()
+        if (auth == null) {
+            _isLoading.value = false
+            val err = "Authentication service is temporarily unavailable. Please check your connection."
+            _authErrorMessage.value = err
+            return@withContext AdminAuthResult.AuthFailed(err)
+        }
 
         try {
-            // First check if matching user exists in Admin registry
-            val registeredAdmin = _adminUsers.value.firstOrNull {
-                it.email.equals(cleanEmail, ignoreCase = true)
+            // 1. Firebase Authentication
+            val authResult = auth.signInWithEmailAndPassword(cleanEmail, pass).await()
+            val firebaseUser = authResult.user
+            if (firebaseUser == null) {
+                _isLoading.value = false
+                val err = "Authentication failed. Unable to resolve user identity."
+                _authErrorMessage.value = err
+                return@withContext AdminAuthResult.AuthFailed(err)
             }
 
-            // Attempt Firebase Auth sign-in if connected
-            var firebaseUid: String? = null
-            try {
-                if (auth.app != null && cleanEmail.isNotEmpty() && pass.isNotEmpty()) {
-                    val authResult = auth.signInWithEmailAndPassword(cleanEmail, pass).await()
-                    firebaseUid = authResult.user?.uid
-                }
+            // 2. Fetch fresh ID token result to inspect Custom Claims
+            val tokenResult = try {
+                firebaseUser.getIdToken(true).await()
             } catch (e: Exception) {
-                Log.w(TAG, "Firebase Auth sign-in non-fatal or offline fallback: ${e.message}")
+                Log.w(TAG, "Failed to refresh ID token: ${e.message}")
+                null
             }
 
-            if (registeredAdmin == null) {
-                // Not in Admin registry -> ACCESS DENIED
-                _isLoading.value = false
-                val error = "Access denied. This account does not have administrator privileges."
-                _authErrorMessage.value = error
+            val claims = tokenResult?.claims ?: emptyMap()
+            val hasAdminClaim = claims["admin"] == true ||
+                    claims["super_admin"] == true ||
+                    claims.containsKey("adminRole") ||
+                    claims.containsKey("role")
+
+            val claimRoleStr = (claims["adminRole"] ?: claims["role"]) as? String
+            val claimRole = if (claimRoleStr != null) AdminRole.fromString(claimRoleStr) else null
+
+            // 3. Fetch Admin record from Firestore adminUsers/{uid}
+            var adminDocData: Map<String, Any?>? = null
+            val firestore = getFirestore()
+            if (firestore != null) {
+                try {
+                    val snapshot = firestore.collection(ADMIN_USERS_COLLECTION)
+                        .document(firebaseUser.uid)
+                        .get()
+                        .await()
+                    if (snapshot.exists()) {
+                        adminDocData = snapshot.data
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Firestore admin document fetch encountered: ${e.message}")
+                }
+            }
+
+            // 4. Server Authorization Verification
+            // A valid Firebase user is NOT automatically an Admin.
+            if (!hasAdminClaim && adminDocData == null) {
+                // Not authorized as an Admin!
+                Log.w(TAG, "Access denied for UID ${firebaseUser.uid} (email: ${firebaseUser.email}): No admin authorization.")
                 try { auth.signOut() } catch (_: Exception) {}
-                return@withContext AdminAuthResult.AccessDenied(error)
-            }
-
-            if (!registeredAdmin.isActive) {
+                _currentAdmin.value = null
                 _isLoading.value = false
-                val error = "Access denied. This administrator account has been disabled by a Super Admin."
-                _authErrorMessage.value = error
+                val deniedMsg = "Access denied. This account does not have administrator authorization."
+                _authErrorMessage.value = deniedMsg
+                return@withContext AdminAuthResult.AccessDenied(deniedMsg)
+            }
+
+            // 5. Parse Admin Profile
+            val adminUser: AdminUser = if (adminDocData != null) {
+                AdminUser.fromMap(firebaseUser.uid, adminDocData)
+            } else {
+                val role = claimRole ?: if (claims["super_admin"] == true) AdminRole.SUPER_ADMIN else AdminRole.ADMIN
+                AdminUser(
+                    uid = firebaseUser.uid,
+                    email = firebaseUser.email ?: cleanEmail,
+                    displayName = firebaseUser.displayName ?: cleanEmail.substringBefore("@"),
+                    role = role,
+                    status = "ACTIVE",
+                    permissions = AdminPermissions.forRole(role),
+                    createdAt = System.currentTimeMillis(),
+                    updatedAt = System.currentTimeMillis(),
+                    lastLoginAt = System.currentTimeMillis(),
+                    createdBy = "SYSTEM_AUTH_CLAIMS"
+                )
+            }
+
+            // 6. Check Active Status
+            if (!adminUser.isActive) {
+                Log.w(TAG, "Administrator account ${adminUser.email} is disabled.")
                 try { auth.signOut() } catch (_: Exception) {}
-                return@withContext AdminAuthResult.AccountDisabled(error)
+                _currentAdmin.value = null
+                _isLoading.value = false
+                val disabledMsg = "Access denied. This administrator account has been disabled by a Super Administrator."
+                _authErrorMessage.value = disabledMsg
+                return@withContext AdminAuthResult.AccountDisabled(disabledMsg)
             }
 
-            // Valid active admin verified
-            val updatedAdmin = registeredAdmin.copy(
-                uid = firebaseUid ?: registeredAdmin.uid,
-                lastLoginAt = System.currentTimeMillis()
-            )
-
-            // Update in-memory and state
-            _adminUsers.value = _adminUsers.value.map {
-                if (it.uid == registeredAdmin.uid || it.email.equals(cleanEmail, ignoreCase = true)) updatedAdmin else it
+            // 7. Update lastLoginAt in Firestore
+            val updatedAdmin = adminUser.copy(lastLoginAt = System.currentTimeMillis())
+            if (firestore != null) {
+                try {
+                    firestore.collection(ADMIN_USERS_COLLECTION)
+                        .document(firebaseUser.uid)
+                        .set(updatedAdmin.toMap())
+                        .await()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to update lastLoginAt in Firestore: ${e.message}")
+                }
             }
-            _currentAdmin.value = updatedAdmin
-            _isLoading.value = false
 
-            // Record audit log
+            // 8. Record Immutable Audit Log
             recordAuditLog(
                 admin = updatedAdmin,
                 action = "ADMIN_LOGIN",
                 target = "command-center",
-                metadata = mapOf("role" to updatedAdmin.role.name)
+                metadata = mapOf("role" to updatedAdmin.role.name, "authProvider" to "firebase_password")
             )
 
+            // 9. Load Admin Directory and Audit Logs if permitted
+            loadAdminDirectoryAndLogs(updatedAdmin)
+
+            _currentAdmin.value = updatedAdmin
+            _isLoading.value = false
             return@withContext AdminAuthResult.Success(updatedAdmin)
+
+        } catch (e: FirebaseAuthInvalidCredentialsException) {
+            _isLoading.value = false
+            val msg = "Invalid administrator email or password. Please verify your credentials."
+            _authErrorMessage.value = msg
+            return@withContext AdminAuthResult.AuthFailed(msg)
+        } catch (e: FirebaseAuthInvalidUserException) {
+            _isLoading.value = false
+            val msg = "Administrator account does not exist or has been deleted."
+            _authErrorMessage.value = msg
+            return@withContext AdminAuthResult.AuthFailed(msg)
+        } catch (e: FirebaseNetworkException) {
+            _isLoading.value = false
+            val msg = "Network connection failed. Secure administration portal requires active internet connectivity."
+            _authErrorMessage.value = msg
+            return@withContext AdminAuthResult.AuthFailed(msg)
         } catch (e: Exception) {
             _isLoading.value = false
-            val error = e.localizedMessage ?: "Authentication failed. Please check your credentials."
-            _authErrorMessage.value = error
-            return@withContext AdminAuthResult.AuthFailed(error)
+            val msg = e.localizedMessage ?: "Authentication failed due to an internal security error."
+            _authErrorMessage.value = msg
+            return@withContext AdminAuthResult.AuthFailed(msg)
         }
     }
 
     /**
-     * Sign out Admin and clear administrative session.
+     * Check if a previously authenticated Firebase user has valid server-side Admin authorization.
+     */
+    suspend fun checkExistingSession(): Boolean = withContext(Dispatchers.IO) {
+        val auth = getAuth() ?: return@withContext false
+        val user = auth.currentUser ?: return@withContext false
+        try {
+            val tokenResult = user.getIdToken(false).await()
+            val claims = tokenResult.claims
+            val hasAdminClaim = claims["admin"] == true ||
+                    claims["super_admin"] == true ||
+                    claims.containsKey("adminRole") ||
+                    claims.containsKey("role")
+
+            val firestore = getFirestore()
+            var adminDocData: Map<String, Any?>? = null
+            if (firestore != null) {
+                try {
+                    val snapshot = firestore.collection(ADMIN_USERS_COLLECTION)
+                        .document(user.uid)
+                        .get()
+                        .await()
+                    if (snapshot.exists()) {
+                        adminDocData = snapshot.data
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Firestore admin fetch in checkExistingSession: ${e.message}")
+                }
+            }
+
+            if (!hasAdminClaim && adminDocData == null) {
+                // User is not an admin
+                _currentAdmin.value = null
+                return@withContext false
+            }
+
+            val adminUser = if (adminDocData != null) {
+                AdminUser.fromMap(user.uid, adminDocData)
+            } else {
+                val roleStr = (claims["adminRole"] ?: claims["role"]) as? String
+                val role = if (roleStr != null) AdminRole.fromString(roleStr) else AdminRole.ADMIN
+                AdminUser(
+                    uid = user.uid,
+                    email = user.email ?: "",
+                    displayName = user.displayName ?: (user.email ?: "").substringBefore("@"),
+                    role = role,
+                    status = "ACTIVE",
+                    permissions = AdminPermissions.forRole(role)
+                )
+            }
+
+            if (!adminUser.isActive) {
+                try { auth.signOut() } catch (_: Exception) {}
+                _currentAdmin.value = null
+                return@withContext false
+            }
+
+            _currentAdmin.value = adminUser
+            loadAdminDirectoryAndLogs(adminUser)
+            return@withContext true
+        } catch (e: Exception) {
+            Log.w(TAG, "Error checking existing admin session: ${e.message}")
+            _currentAdmin.value = null
+            return@withContext false
+        }
+    }
+
+    /**
+     * Sign out Admin and terminate administrative session completely.
      */
     fun logoutAdmin() {
         val admin = _currentAdmin.value
@@ -199,8 +319,10 @@ object AdminAuthManager {
             )
         }
         _currentAdmin.value = null
+        _adminUsers.value = emptyList()
+        _auditLogs.value = emptyList()
         try {
-            auth.signOut()
+            getAuth()?.signOut()
         } catch (e: Exception) {
             Log.w(TAG, "Error signing out of Firebase Auth: ${e.message}")
         }
@@ -229,36 +351,92 @@ object AdminAuthManager {
     }
 
     // ==========================================
+    // DATA SYNCHRONIZATION (ADMINS & AUDIT LOGS)
+    // ==========================================
+
+    private fun loadAdminDirectoryAndLogs(admin: AdminUser) {
+        coroutineScope.launch {
+            val firestore = getFirestore()
+            // Load admin users list if user has userManagement permission or is Super Admin
+            if (admin.role == AdminRole.SUPER_ADMIN || admin.permissions.userManagement) {
+                if (firestore != null) {
+                    try {
+                        val usersSnapshot = firestore.collection(ADMIN_USERS_COLLECTION)
+                            .orderBy("createdAt", Query.Direction.DESCENDING)
+                            .get()
+                            .await()
+                        val list = usersSnapshot.documents.mapNotNull { doc ->
+                            doc.data?.let { AdminUser.fromMap(doc.id, it) }
+                        }
+                        if (list.isNotEmpty()) {
+                            _adminUsers.value = list
+                        } else {
+                            _adminUsers.value = listOf(admin)
+                        }
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to load admin directory from Firestore: ${e.message}")
+                        _adminUsers.value = listOf(admin)
+                    }
+                } else {
+                    _adminUsers.value = listOf(admin)
+                }
+            } else {
+                _adminUsers.value = listOf(admin)
+            }
+
+            // Load audit logs if permitted
+            if (admin.role == AdminRole.SUPER_ADMIN || admin.permissions.analytics || admin.permissions.moderation) {
+                if (firestore != null) {
+                    try {
+                        val logsSnapshot = firestore.collection(AUDIT_LOGS_COLLECTION)
+                            .orderBy("timestamp", Query.Direction.DESCENDING)
+                            .limit(100)
+                            .get()
+                            .await()
+                        val list = logsSnapshot.documents.mapNotNull { doc ->
+                            doc.data?.let { AdminAuditLog.fromMap(doc.id, it) }
+                        }
+                        _auditLogs.value = list
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Failed to load audit logs from Firestore: ${e.message}")
+                    }
+                }
+            }
+        }
+    }
+
+    // ==========================================
     // ADMIN USER MANAGEMENT (SUPER_ADMIN ONLY)
     // ==========================================
 
-    fun createAdminUser(
+    suspend fun createAdminUser(
         email: String,
         displayName: String,
         role: AdminRole,
         customPermissions: AdminPermissions? = null
-    ): Result<AdminUser> {
+    ): Result<AdminUser> = withContext(Dispatchers.IO) {
         val current = _currentAdmin.value
         if (current == null || current.role != AdminRole.SUPER_ADMIN) {
-            return Result.failure(IllegalStateException("Unauthorized: Only Super Administrators can create or invite new administrators."))
+            return@withContext Result.failure(IllegalStateException("Unauthorized: Only Super Administrators can create or invite new administrators."))
         }
 
         val cleanEmail = email.trim()
         if (cleanEmail.isEmpty() || !cleanEmail.contains("@")) {
-            return Result.failure(IllegalArgumentException("Please provide a valid email address."))
+            return@withContext Result.failure(IllegalArgumentException("Please provide a valid email address."))
         }
 
         if (_adminUsers.value.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
-            return Result.failure(IllegalArgumentException("An administrator with this email already exists."))
+            return@withContext Result.failure(IllegalArgumentException("An administrator with this email already exists."))
         }
 
         val permissions = customPermissions ?: AdminPermissions.forRole(role)
+        val newUid = "admin_${UUID.randomUUID().toString().take(12)}"
         val newAdmin = AdminUser(
-            uid = "admin_${UUID.randomUUID().toString().take(8)}",
+            uid = newUid,
             email = cleanEmail,
             displayName = displayName.ifBlank { cleanEmail.substringBefore("@") },
             role = role,
-            status = "active",
+            status = "ACTIVE",
             permissions = permissions,
             createdAt = System.currentTimeMillis(),
             updatedAt = System.currentTimeMillis(),
@@ -266,7 +444,20 @@ object AdminAuthManager {
             createdBy = current.uid
         )
 
-        _adminUsers.value = _adminUsers.value + newAdmin
+        val firestore = getFirestore()
+        if (firestore != null) {
+            try {
+                firestore.collection(ADMIN_USERS_COLLECTION)
+                    .document(newUid)
+                    .set(newAdmin.toMap())
+                    .await()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error writing new admin to Firestore: ${e.message}")
+                return@withContext Result.failure(e)
+            }
+        }
+
+        _adminUsers.value = listOf(newAdmin) + _adminUsers.value
 
         recordAuditLog(
             admin = current,
@@ -275,27 +466,40 @@ object AdminAuthManager {
             metadata = mapOf("role" to role.name, "uid" to newAdmin.uid)
         )
 
-        return Result.success(newAdmin)
+        return@withContext Result.success(newAdmin)
     }
 
-    fun updateAdminRoleAndPermissions(
+    suspend fun updateAdminRoleAndPermissions(
         targetUid: String,
         newRole: AdminRole,
         newPermissions: AdminPermissions
-    ): Result<Unit> {
+    ): Result<Unit> = withContext(Dispatchers.IO) {
         val current = _currentAdmin.value
         if (current == null || current.role != AdminRole.SUPER_ADMIN) {
-            return Result.failure(IllegalStateException("Unauthorized: Only Super Administrators can modify administrator roles."))
+            return@withContext Result.failure(IllegalStateException("Unauthorized: Only Super Administrators can modify administrator roles."))
         }
 
         val target = _adminUsers.value.firstOrNull { it.uid == targetUid }
-            ?: return Result.failure(IllegalArgumentException("Administrator not found."))
+            ?: return@withContext Result.failure(IllegalArgumentException("Administrator not found."))
 
         val updated = target.copy(
             role = newRole,
             permissions = newPermissions,
             updatedAt = System.currentTimeMillis()
         )
+
+        val firestore = getFirestore()
+        if (firestore != null) {
+            try {
+                firestore.collection(ADMIN_USERS_COLLECTION)
+                    .document(targetUid)
+                    .set(updated.toMap())
+                    .await()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error updating admin in Firestore: ${e.message}")
+                return@withContext Result.failure(e)
+            }
+        }
 
         _adminUsers.value = _adminUsers.value.map { if (it.uid == targetUid) updated else it }
         if (_currentAdmin.value?.uid == targetUid) {
@@ -309,28 +513,41 @@ object AdminAuthManager {
             metadata = mapOf("oldRole" to target.role.name, "newRole" to newRole.name)
         )
 
-        return Result.success(Unit)
+        return@withContext Result.success(Unit)
     }
 
-    fun toggleAdminStatus(targetUid: String, enable: Boolean): Result<Unit> {
+    suspend fun toggleAdminStatus(targetUid: String, enable: Boolean): Result<Unit> = withContext(Dispatchers.IO) {
         val current = _currentAdmin.value
         if (current == null || current.role != AdminRole.SUPER_ADMIN) {
-            return Result.failure(IllegalStateException("Unauthorized: Only Super Administrators can enable or disable administrator accounts."))
+            return@withContext Result.failure(IllegalStateException("Unauthorized: Only Super Administrators can enable or disable administrator accounts."))
         }
 
         if (current.uid == targetUid && !enable) {
-            return Result.failure(IllegalStateException("Cannot disable your own Super Administrator account."))
+            return@withContext Result.failure(IllegalStateException("Cannot disable your own Super Administrator account."))
         }
 
         val target = _adminUsers.value.firstOrNull { it.uid == targetUid }
-            ?: return Result.failure(IllegalArgumentException("Administrator not found."))
+            ?: return@withContext Result.failure(IllegalArgumentException("Administrator not found."))
 
-        val newStatus = if (enable) "active" else "disabled"
+        val newStatus = if (enable) "ACTIVE" else "DISABLED"
         val updated = target.copy(
             status = newStatus,
             disabledAt = if (!enable) System.currentTimeMillis() else null,
             updatedAt = System.currentTimeMillis()
         )
+
+        val firestore = getFirestore()
+        if (firestore != null) {
+            try {
+                firestore.collection(ADMIN_USERS_COLLECTION)
+                    .document(targetUid)
+                    .set(updated.toMap())
+                    .await()
+            } catch (e: Exception) {
+                Log.e(TAG, "Error toggling admin status in Firestore: ${e.message}")
+                return@withContext Result.failure(e)
+            }
+        }
 
         _adminUsers.value = _adminUsers.value.map { if (it.uid == targetUid) updated else it }
 
@@ -341,7 +558,7 @@ object AdminAuthManager {
             metadata = mapOf("status" to newStatus)
         )
 
-        return Result.success(Unit)
+        return@withContext Result.success(Unit)
     }
 
     // ==========================================
@@ -363,5 +580,19 @@ object AdminAuthManager {
             metadata = metadata
         )
         _auditLogs.value = listOf(log) + _auditLogs.value
+
+        coroutineScope.launch {
+            val firestore = getFirestore()
+            if (firestore != null) {
+                try {
+                    firestore.collection(AUDIT_LOGS_COLLECTION)
+                        .document(log.id)
+                        .set(log.toMap())
+                        .await()
+                } catch (e: Exception) {
+                    Log.w(TAG, "Firestore audit log persist non-fatal error: ${e.message}")
+                }
+            }
+        }
     }
 }
