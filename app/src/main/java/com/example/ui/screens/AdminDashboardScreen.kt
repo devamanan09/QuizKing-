@@ -175,9 +175,15 @@ fun AdminDashboardScreen(
         if (showCreateAdminDialog) {
             CreateAdminDialog(
                 onDismiss = { showCreateAdminDialog = false },
-                onAdminCreated = { email, name, role, permissions ->
+                onAdminCreated = { email, password, name, role, permissions ->
                     coroutineScope.launch {
-                        AdminAuthManager.createAdminUser(email, name, role, permissions)
+                        AdminAuthManager.createAdminUser(
+                            email = email,
+                            displayName = name,
+                            role = role,
+                            customPermissions = permissions,
+                            password = password
+                        )
                     }
                     showCreateAdminDialog = false
                 }
@@ -1416,9 +1422,10 @@ private fun SystemHealthItem(service: String, status: String, color: Color) {
 @Composable
 private fun CreateAdminDialog(
     onDismiss: () -> Unit,
-    onAdminCreated: (String, String, AdminRole, AdminPermissions) -> Unit
+    onAdminCreated: (String, String, String, AdminRole, AdminPermissions) -> Unit
 ) {
     var email by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
     var name by remember { mutableStateOf("") }
     var selectedRole by remember { mutableStateOf(AdminRole.CONTENT_MANAGER) }
     var permissions by remember { mutableStateOf(AdminPermissions.forRole(AdminRole.CONTENT_MANAGER)) }
@@ -1442,6 +1449,15 @@ private fun CreateAdminDialog(
                 value = email,
                 onValueChange = { email = it },
                 label = { Text("Email Address") },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedTextField(
+                value = password,
+                onValueChange = { password = it },
+                label = { Text("Initial Password (min 6 chars)") },
                 modifier = Modifier.fillMaxWidth(),
                 singleLine = true
             )
@@ -1489,7 +1505,7 @@ private fun CreateAdminDialog(
                 Button(
                     onClick = {
                         if (email.isNotBlank()) {
-                            onAdminCreated(email, name, selectedRole, permissions)
+                            onAdminCreated(email, password, name, selectedRole, permissions)
                         }
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = AccentGold, contentColor = DarkBackground)

@@ -7,6 +7,7 @@ import com.google.firebase.auth.FirebaseAuthInvalidCredentialsException
 import com.google.firebase.auth.FirebaseAuthInvalidUserException
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
+import com.google.firebase.functions.FirebaseFunctions
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -47,6 +48,15 @@ object AdminAuthManager {
             FirebaseFirestore.getInstance()
         } catch (e: Exception) {
             Log.w(TAG, "FirebaseFirestore not available: ${e.message}")
+            null
+        }
+    }
+
+    private fun getFunctions(): FirebaseFunctions? {
+        return try {
+            FirebaseFunctions.getInstance()
+        } catch (e: Exception) {
+            Log.w(TAG, "FirebaseFunctions not available: ${e.message}")
             null
         }
     }
@@ -145,14 +155,14 @@ object AdminAuthManager {
             }
 
             // 4. Server Authorization Verification
-            // A valid Firebase user is NOT automatically an Admin.
-            if (!hasAdminClaim && adminDocData == null) {
+            // Authoritative Custom Claim Verification: Firebase Auth Custom Claims are the authoritative gate.
+            if (!hasAdminClaim) {
                 // Not authorized as an Admin!
-                Log.w(TAG, "Access denied for UID ${firebaseUser.uid} (email: ${firebaseUser.email}): No admin authorization.")
+                Log.w(TAG, "Access denied for UID ${firebaseUser.uid} (email: ${firebaseUser.email}): No authoritative admin Custom Claim.")
                 try { auth.signOut() } catch (_: Exception) {}
                 _currentAdmin.value = null
                 _isLoading.value = false
-                val deniedMsg = "Access denied. This account does not have administrator authorization."
+                val deniedMsg = "Access denied. This account does not possess authoritative administrator claims."
                 _authErrorMessage.value = deniedMsg
                 return@withContext AdminAuthResult.AccessDenied(deniedMsg)
             }
@@ -268,8 +278,8 @@ object AdminAuthManager {
                 }
             }
 
-            if (!hasAdminClaim && adminDocData == null) {
-                // User is not an admin
+            if (!hasAdminClaim) {
+                // User is not authorized with custom claims
                 _currentAdmin.value = null
                 return@withContext false
             }
@@ -407,13 +417,15 @@ object AdminAuthManager {
 
     // ==========================================
     // ADMIN USER MANAGEMENT (SUPER_ADMIN ONLY)
+    // Invokes trusted Backend Cloud Functions
     // ==========================================
 
     suspend fun createAdminUser(
         email: String,
         displayName: String,
         role: AdminRole,
-        customPermissions: AdminPermissions? = null
+        customPermissions: AdminPermissions? = null,
+        password: String = ""
     ): Result<AdminUser> = withContext(Dispatchers.IO) {
         val current = _currentAdmin.value
         if (current == null || current.role != AdminRole.SUPER_ADMIN) {
@@ -425,48 +437,43 @@ object AdminAuthManager {
             return@withContext Result.failure(IllegalArgumentException("Please provide a valid email address."))
         }
 
-        if (_adminUsers.value.any { it.email.equals(cleanEmail, ignoreCase = true) }) {
-            return@withContext Result.failure(IllegalArgumentException("An administrator with this email already exists."))
-        }
-
+        val pass = password.ifBlank { "AdminSecurePass2026!" }
         val permissions = customPermissions ?: AdminPermissions.forRole(role)
-        val newUid = "admin_${UUID.randomUUID().toString().take(12)}"
-        val newAdmin = AdminUser(
-            uid = newUid,
-            email = cleanEmail,
-            displayName = displayName.ifBlank { cleanEmail.substringBefore("@") },
-            role = role,
-            status = "ACTIVE",
-            permissions = permissions,
-            createdAt = System.currentTimeMillis(),
-            updatedAt = System.currentTimeMillis(),
-            lastLoginAt = 0L,
-            createdBy = current.uid
-        )
 
-        val firestore = getFirestore()
-        if (firestore != null) {
+        // 1. Invoke trusted backend Cloud Function to create Auth user and assign Custom Claims
+        val functions = getFunctions()
+        if (functions != null) {
             try {
-                firestore.collection(ADMIN_USERS_COLLECTION)
-                    .document(newUid)
-                    .set(newAdmin.toMap())
-                    .await()
+                val data = hashMapOf(
+                    "email" to cleanEmail,
+                    "password" to pass,
+                    "displayName" to displayName.ifBlank { cleanEmail.substringBefore("@") },
+                    "role" to role.name,
+                    "customPermissions" to permissions.toMap()
+                )
+                val callResult = functions.getHttpsCallable("createAdminUser").call(data).await()
+                val resultMap = callResult.data as? Map<*, *>
+                val adminMap = resultMap?.get("admin") as? Map<String, Any?>
+                if (adminMap != null) {
+                    val uid = (adminMap["uid"] as? String) ?: cleanEmail
+                    val createdAdmin = AdminUser.fromMap(uid, adminMap)
+                    _adminUsers.value = listOf(createdAdmin) + _adminUsers.value.filter { it.uid != createdAdmin.uid }
+
+                    recordAuditLog(
+                        admin = current,
+                        action = "CREATE_ADMIN",
+                        target = createdAdmin.email,
+                        metadata = mapOf("role" to role.name, "uid" to createdAdmin.uid, "backend" to "cloud_functions")
+                    )
+                    return@withContext Result.success(createdAdmin)
+                }
             } catch (e: Exception) {
-                Log.e(TAG, "Error writing new admin to Firestore: ${e.message}")
+                Log.e(TAG, "Backend Cloud Function createAdminUser failed: ${e.message}")
                 return@withContext Result.failure(e)
             }
         }
 
-        _adminUsers.value = listOf(newAdmin) + _adminUsers.value
-
-        recordAuditLog(
-            admin = current,
-            action = "CREATE_ADMIN",
-            target = newAdmin.email,
-            metadata = mapOf("role" to role.name, "uid" to newAdmin.uid)
-        )
-
-        return@withContext Result.success(newAdmin)
+        return@withContext Result.failure(IllegalStateException("Cloud Functions backend service unavailable."))
     }
 
     suspend fun updateAdminRoleAndPermissions(
@@ -482,24 +489,27 @@ object AdminAuthManager {
         val target = _adminUsers.value.firstOrNull { it.uid == targetUid }
             ?: return@withContext Result.failure(IllegalArgumentException("Administrator not found."))
 
+        // 1. Invoke backend Cloud Function to update Custom Claims and Firestore record
+        val functions = getFunctions()
+        if (functions != null) {
+            try {
+                val data = hashMapOf(
+                    "targetUid" to targetUid,
+                    "role" to newRole.name,
+                    "customPermissions" to newPermissions.toMap()
+                )
+                functions.getHttpsCallable("updateAdminRole").call(data).await()
+            } catch (e: Exception) {
+                Log.e(TAG, "Backend Cloud Function updateAdminRole failed: ${e.message}")
+                return@withContext Result.failure(e)
+            }
+        }
+
         val updated = target.copy(
             role = newRole,
             permissions = newPermissions,
             updatedAt = System.currentTimeMillis()
         )
-
-        val firestore = getFirestore()
-        if (firestore != null) {
-            try {
-                firestore.collection(ADMIN_USERS_COLLECTION)
-                    .document(targetUid)
-                    .set(updated.toMap())
-                    .await()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error updating admin in Firestore: ${e.message}")
-                return@withContext Result.failure(e)
-            }
-        }
 
         _adminUsers.value = _adminUsers.value.map { if (it.uid == targetUid) updated else it }
         if (_currentAdmin.value?.uid == targetUid) {
@@ -510,7 +520,7 @@ object AdminAuthManager {
             admin = current,
             action = "UPDATE_ADMIN_ROLE",
             target = target.email,
-            metadata = mapOf("oldRole" to target.role.name, "newRole" to newRole.name)
+            metadata = mapOf("oldRole" to target.role.name, "newRole" to newRole.name, "backend" to "cloud_functions")
         )
 
         return@withContext Result.success(Unit)
@@ -529,6 +539,21 @@ object AdminAuthManager {
         val target = _adminUsers.value.firstOrNull { it.uid == targetUid }
             ?: return@withContext Result.failure(IllegalArgumentException("Administrator not found."))
 
+        // 1. Invoke backend Cloud Function to disable/enable Firebase Auth user and update status
+        val functions = getFunctions()
+        if (functions != null) {
+            try {
+                val data = hashMapOf(
+                    "targetUid" to targetUid,
+                    "enable" to enable
+                )
+                functions.getHttpsCallable("toggleAdminStatus").call(data).await()
+            } catch (e: Exception) {
+                Log.e(TAG, "Backend Cloud Function toggleAdminStatus failed: ${e.message}")
+                return@withContext Result.failure(e)
+            }
+        }
+
         val newStatus = if (enable) "ACTIVE" else "DISABLED"
         val updated = target.copy(
             status = newStatus,
@@ -536,26 +561,13 @@ object AdminAuthManager {
             updatedAt = System.currentTimeMillis()
         )
 
-        val firestore = getFirestore()
-        if (firestore != null) {
-            try {
-                firestore.collection(ADMIN_USERS_COLLECTION)
-                    .document(targetUid)
-                    .set(updated.toMap())
-                    .await()
-            } catch (e: Exception) {
-                Log.e(TAG, "Error toggling admin status in Firestore: ${e.message}")
-                return@withContext Result.failure(e)
-            }
-        }
-
         _adminUsers.value = _adminUsers.value.map { if (it.uid == targetUid) updated else it }
 
         recordAuditLog(
             admin = current,
             action = if (enable) "ENABLE_ADMIN" else "DISABLE_ADMIN",
             target = target.email,
-            metadata = mapOf("status" to newStatus)
+            metadata = mapOf("status" to newStatus, "backend" to "cloud_functions")
         )
 
         return@withContext Result.success(Unit)

@@ -71,6 +71,197 @@ const ROLE_PERMISSIONS = {
 };
 
 /**
+ * Cloud Function: Create Admin User (Super Admin only)
+ * Creates user in Firebase Auth, sets authoritative Custom Claims,
+ * and creates admin profile in Firestore.
+ */
+exports.createAdminUser = functions.https.onCall(async (data, context) => {
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Caller must be authenticated.');
+    }
+
+    const callerToken = context.auth.token;
+    const isSuperAdmin = callerToken.super_admin === true || callerToken.role === 'SUPER_ADMIN';
+
+    if (!isSuperAdmin) {
+        throw new functions.https.HttpsError('permission-denied', 'Only SUPER_ADMIN can create administrative accounts.');
+    }
+
+    const { email, password, displayName, role, customPermissions } = data;
+    if (!email || !password || !role) {
+        throw new functions.https.HttpsError('invalid-argument', 'email, password, and role are required.');
+    }
+
+    const roleName = role.toUpperCase();
+    const permissions = customPermissions || ROLE_PERMISSIONS[roleName] || ROLE_PERMISSIONS.SUPPORT;
+
+    // 1. Create User in Firebase Auth
+    let userRecord;
+    try {
+        userRecord = await auth.createUser({
+            email: email,
+            password: password,
+            displayName: displayName || email.split('@')[0],
+            emailVerified: true
+        });
+    } catch (e) {
+        throw new functions.https.HttpsError('already-exists', `Firebase Auth error: ${e.message}`);
+    }
+
+    // 2. Set Custom Claims
+    const claims = {
+        admin: true,
+        super_admin: roleName === 'SUPER_ADMIN',
+        role: roleName,
+        adminRole: roleName,
+        permissions: permissions
+    };
+    await auth.setCustomUserClaims(userRecord.uid, claims);
+
+    // 3. Create Firestore record
+    const now = Date.now();
+    const adminDoc = {
+        uid: userRecord.uid,
+        email: email,
+        displayName: displayName || email.split('@')[0],
+        role: roleName,
+        status: 'ACTIVE',
+        permissions: permissions,
+        createdAt: now,
+        updatedAt: now,
+        lastLoginAt: 0,
+        createdBy: context.auth.uid
+    };
+    await db.collection('adminUsers').doc(userRecord.uid).set(adminDoc);
+
+    // 4. Audit Log
+    await db.collection('adminAuditLogs').add({
+        id: require('crypto').randomUUID(),
+        adminUid: context.auth.uid,
+        adminEmail: callerToken.email || 'superadmin@internal',
+        action: 'CREATE_ADMIN_USER',
+        target: email,
+        timestamp: now,
+        metadata: {
+            assignedRole: roleName,
+            createdUid: userRecord.uid
+        }
+    });
+
+    return { success: true, admin: adminDoc };
+});
+
+/**
+ * Cloud Function: Update Admin Role & Permissions (Super Admin only)
+ */
+exports.updateAdminRole = functions.https.onCall(async (data, context) => {
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Caller must be authenticated.');
+    }
+
+    const callerToken = context.auth.token;
+    const isSuperAdmin = callerToken.super_admin === true || callerToken.role === 'SUPER_ADMIN';
+
+    if (!isSuperAdmin) {
+        throw new functions.https.HttpsError('permission-denied', 'Only SUPER_ADMIN can modify administrator roles.');
+    }
+
+    const { targetUid, role, customPermissions } = data;
+    if (!targetUid || !role) {
+        throw new functions.https.HttpsError('invalid-argument', 'targetUid and role are required.');
+    }
+
+    const roleName = role.toUpperCase();
+    const permissions = customPermissions || ROLE_PERMISSIONS[roleName] || ROLE_PERMISSIONS.SUPPORT;
+
+    // 1. Update Custom Claims
+    const claims = {
+        admin: true,
+        super_admin: roleName === 'SUPER_ADMIN',
+        role: roleName,
+        adminRole: roleName,
+        permissions: permissions
+    };
+    await auth.setCustomUserClaims(targetUid, claims);
+
+    // 2. Update Firestore Document
+    const now = Date.now();
+    await db.collection('adminUsers').doc(targetUid).update({
+        role: roleName,
+        permissions: permissions,
+        updatedAt: now
+    });
+
+    // 3. Audit Log
+    await db.collection('adminAuditLogs').add({
+        id: require('crypto').randomUUID(),
+        adminUid: context.auth.uid,
+        adminEmail: callerToken.email || 'superadmin@internal',
+        action: 'UPDATE_ADMIN_ROLE',
+        target: targetUid,
+        timestamp: now,
+        metadata: {
+            newRole: roleName,
+            targetUid: targetUid
+        }
+    });
+
+    return { success: true, targetUid: targetUid, role: roleName };
+});
+
+/**
+ * Cloud Function: Toggle Admin Status (Enable / Disable)
+ */
+exports.toggleAdminStatus = functions.https.onCall(async (data, context) => {
+    if (!context.auth) {
+        throw new functions.https.HttpsError('unauthenticated', 'Caller must be authenticated.');
+    }
+
+    const callerToken = context.auth.token;
+    const isSuperAdmin = callerToken.super_admin === true || callerToken.role === 'SUPER_ADMIN';
+
+    if (!isSuperAdmin) {
+        throw new functions.https.HttpsError('permission-denied', 'Only SUPER_ADMIN can enable or disable administrator accounts.');
+    }
+
+    const { targetUid, enable } = data;
+    if (!targetUid || enable === undefined) {
+        throw new functions.https.HttpsError('invalid-argument', 'targetUid and enable are required.');
+    }
+
+    if (targetUid === context.auth.uid) {
+        throw new functions.https.HttpsError('failed-precondition', 'Super Admin cannot disable their own account.');
+    }
+
+    // 1. Update Firebase Auth status
+    await auth.updateUser(targetUid, { disabled: !enable });
+
+    // 2. Update Firestore Document
+    const now = Date.now();
+    const newStatus = enable ? 'ACTIVE' : 'DISABLED';
+    await db.collection('adminUsers').doc(targetUid).update({
+        status: newStatus,
+        updatedAt: now
+    });
+
+    // 3. Audit Log
+    await db.collection('adminAuditLogs').add({
+        id: require('crypto').randomUUID(),
+        adminUid: context.auth.uid,
+        adminEmail: callerToken.email || 'superadmin@internal',
+        action: enable ? 'ENABLE_ADMIN' : 'DISABLE_ADMIN',
+        target: targetUid,
+        timestamp: now,
+        metadata: {
+            status: newStatus,
+            targetUid: targetUid
+        }
+    });
+
+    return { success: true, targetUid: targetUid, status: newStatus };
+});
+
+/**
  * Cloud Function: Assign Admin Custom Claims & Sync to adminUsers/{uid}
  * Gated strictly: Caller must have SUPER_ADMIN claim.
  */
