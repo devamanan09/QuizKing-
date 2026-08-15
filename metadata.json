@@ -1,0 +1,6 @@
+{
+  "name": "QuizKing",
+  "description": "Esports-style competitive quiz platform featuring real-time duels, ranked leagues, automated RAG question repository, and AI coach with Frosted Glass design styling.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
