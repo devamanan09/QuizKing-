@@ -201,6 +201,24 @@ data class AdminAuditLog(
     }
 }
 
+sealed class AppUserSession {
+    data class Player(
+        val uid: String,
+        val email: String,
+        val displayName: String
+    ) : AppUserSession()
+
+    data class Admin(
+        val adminUser: AdminUser
+    ) : AppUserSession()
+}
+
+sealed class AuthResult {
+    data class Success(val session: AppUserSession) : AuthResult()
+    data class AccountDisabled(val reason: String) : AuthResult()
+    data class AuthFailed(val errorMessage: String) : AuthResult()
+}
+
 sealed class AdminAuthResult {
     data class Success(val adminUser: AdminUser) : AdminAuthResult()
     data class AccessDenied(val reason: String) : AdminAuthResult()
